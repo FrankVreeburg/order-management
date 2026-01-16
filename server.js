@@ -1,53 +1,57 @@
-// Order Management System - Version 0.1
-
-// Import Express - think of this like grabbing a tool from your toolbox
+// Import Express - the framework for building our web server
 const express = require("express");
+
+// Import CORS - allows our frontend (different port) to access this backend
+const cors = require("cors");
 
 // Create an Express application - this is your web server
 const app = express();
 
-// This tells Express to understand JSON data in requests
-// (orders will be sent as JSON)
+// Middleware: tells Express to understand JSON data in requests
 app.use(express.json());
 
-// In-memory storage for now (we'll use a real database later)
-// Think of this as a temporary notepad
+// Middleware: enables Cross-Origin Resource Sharing
+// This allows our React app (localhost:3001) to fetch data from this API (localhost:3000)
+app.use(cors());
+
+// In-memory storage (data disappears when server restarts - we'll fix this with a database later)
 let orders = [];
 let products = [
   { id: 1, name: "Widget A", stock: 100 },
   { id: 2, name: "Widget B", stock: 50 },
 ];
 
-// ===== ENDPOINTS (these are like different doors into your system) =====
+// ===== API ENDPOINTS =====
 
-// GET all products - see what's available
+// GET /products - returns list of all products with current stock levels
 app.get("/products", (req, res) => {
   res.json(products);
 });
 
-// GET all orders - see order history
+// GET /orders - returns list of all orders
 app.get("/orders", (req, res) => {
   res.json(orders);
 });
 
-// POST create a new order - this is where the magic happens!
+// POST /orders - creates a new order
+// Expects JSON body with: productId, quantity, customerName
 app.post("/orders", (req, res) => {
   const { productId, quantity, customerName } = req.body;
 
-  // Find the product
+  // Find the requested product in our inventory
   const product = products.find((p) => p.id === productId);
 
-  // Check if product exists
+  // Validation: check if product exists
   if (!product) {
     return res.status(404).json({ error: "Product not found" });
   }
 
-  // Check if enough stock
+  // Validation: check if we have enough stock
   if (product.stock < quantity) {
     return res.status(400).json({ error: "Insufficient stock" });
   }
 
-  // Create the order
+  // Create new order object
   const newOrder = {
     id: orders.length + 1,
     productId,
@@ -58,16 +62,64 @@ app.post("/orders", (req, res) => {
     createdAt: new Date(),
   };
 
-  // Reduce stock
+  // Deduct ordered quantity from inventory
   product.stock -= quantity;
 
-  // Save order
+  // Add order to our orders array
   orders.push(newOrder);
 
+  // Send back the created order with 201 (Created) status
   res.status(201).json(newOrder);
 });
 
-// Start the server on port 3000
+// PATCH /orders/:id - updates an order's status
+app.patch("/orders/:id", (req, res) => {
+  const orderId = parseInt(req.params.id); // Get order ID from URL
+  const { status } = req.body; // Get new status from request body
+
+  // Find the order
+  const order = orders.find((o) => o.id === orderId);
+
+  // Check if order exists
+  if (!order) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+
+  // Update the status
+  order.status = status;
+
+  // Send back the updated order
+  res.json(order);
+});
+
+// POST /products - creates a new product
+app.post("/products", (req, res) => {
+  const { name, stock } = req.body;
+
+  // Validation
+  if (!name || stock === undefined) {
+    return res.status(400).json({ error: "Name and stock are required" });
+  }
+
+  if (stock < 0) {
+    return res.status(400).json({ error: "Stock cannot be negative" });
+  }
+
+  // Create new product
+  const newProduct = {
+    id: products.length > 0 ? Math.max(...products.map((p) => p.id)) + 1 : 1,
+    name,
+    stock: parseInt(stock),
+  };
+
+  // Add to products array
+  products.push(newProduct);
+
+  // Return the created product
+  res.status(201).json(newProduct);
+});
+
+// Start the server and listen on port 3000
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
