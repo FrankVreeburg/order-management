@@ -119,6 +119,31 @@ app.post("/products", (req, res) => {
   res.status(201).json(newProduct);
 });
 
+// PATCH /products/:id - updates a product's stock
+app.patch("/products/:id", (req, res) => {
+  const productId = parseInt(req.params.id);
+  const { stock } = req.body;
+
+  // Find the product
+  const product = products.find((p) => p.id === productId);
+
+  // Check if product exists
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+
+  // Validate stock
+  if (stock < 0) {
+    return res.status(400).json({ error: "Stock cannot be negative" });
+  }
+
+  // Update the stock
+  product.stock = parseInt(stock);
+
+  // Send back the updated product
+  res.json(product);
+});
+
 // Start the server and listen on port 3000
 const PORT = 3000;
 app.listen(PORT, () => {
