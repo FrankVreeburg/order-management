@@ -311,30 +311,42 @@ app.post("/orders", async (req, res) => {
 });
 
 // PATCH /orders/:id - updates an order's status
-app.patch("/orders/:id", (req, res) => {
-  const orderId = parseInt(req.params.id); // Get order ID from URL
-  const { status } = req.body; // Get new status from request body
+app.patch("/orders/:id", async (req, res) => {
+  const orderId = parseInt(req.params.id);
+  const { status } = req.body;
 
-  // Find the order
-  const order = orders.find((o) => o.id === orderId);
-
-  // Check if order exists
-  if (!order) {
-    return res.status(404).json({ error: "Order not found" });
+  if (!status) {
+    return res.status(400).json({ error: "Status is required" });
   }
 
-  // Update the status
-  order.status = status;
+  try {
+    const result = await pool.query(
+      "UPDATE orders SET status = $1 WHERE id = $2 RETURNING *",
+      [status, orderId],
+    );
 
-  // Send back the updated order
-  res.json(order);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to update order" });
+  }
 });
 
 // ===== WORKER ENDPOINTS =====
 
 // GET /workers - get all workers
-app.get("/workers", (req, res) => {
-  res.json(workers);
+app.get("/workers", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM workers ORDER BY id");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch workers" });
+  }
 });
 
 // POST /workers - create a new worker
