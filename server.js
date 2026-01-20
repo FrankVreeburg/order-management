@@ -4,6 +4,27 @@ const express = require("express");
 // Import CORS - allows our frontend (different port) to access this backend
 const cors = require("cors");
 
+// Connect to Database PG
+const { Pool } = require("pg");
+
+// Database connection
+const pool = new Pool({
+  user: "postgres",
+  host: "localhost",
+  database: "order_management",
+  password: "+76edRFT(//!@ds", // ← Change this to your actual password
+  port: 5432,
+});
+
+// Test database connection
+pool.connect((err) => {
+  if (err) {
+    console.error("❌ Database connection error:", err);
+  } else {
+    console.log("✅ Connected to PostgreSQL database");
+  }
+});
+
 // Create an Express application - this is your web server
 const app = express();
 
@@ -62,76 +83,18 @@ let workers = [
 // ===== API ENDPOINTS =====
 
 // GET /products - returns list of all products with current stock levels
-app.get("/products", (req, res) => {
-  res.json(products);
-});
-
-// GET /orders - returns list of all orders
-app.get("/orders", (req, res) => {
-  res.json(orders);
-});
-
-// POST /orders - creates a new order
-// Expects JSON body with: productId, quantity, customerName
-app.post("/orders", (req, res) => {
-  const { productId, quantity, customerName } = req.body;
-
-  // Find the requested product in our inventory
-  const product = products.find((p) => p.id === productId);
-
-  // Validation: check if product exists
-  if (!product) {
-    return res.status(404).json({ error: "Product not found" });
+app.get("/products", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM products ORDER BY id");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch products" });
   }
-
-  // Validation: check if we have enough stock
-  if (product.stock < quantity) {
-    return res.status(400).json({ error: "Insufficient stock" });
-  }
-
-  // Create new order object
-  const newOrder = {
-    id: orders.length + 1,
-    productId,
-    productName: product.name,
-    quantity,
-    customerName,
-    status: "pending",
-    createdAt: new Date(),
-  };
-
-  // Deduct ordered quantity from inventory
-  product.stock -= quantity;
-
-  // Add order to our orders array
-  orders.push(newOrder);
-
-  // Send back the created order with 201 (Created) status
-  res.status(201).json(newOrder);
-});
-
-// PATCH /orders/:id - updates an order's status
-app.patch("/orders/:id", (req, res) => {
-  const orderId = parseInt(req.params.id); // Get order ID from URL
-  const { status } = req.body; // Get new status from request body
-
-  // Find the order
-  const order = orders.find((o) => o.id === orderId);
-
-  // Check if order exists
-  if (!order) {
-    return res.status(404).json({ error: "Order not found" });
-  }
-
-  // Update the status
-  order.status = status;
-
-  // Send back the updated order
-  res.json(order);
 });
 
 // POST /products - creates a new product
-app.post("/products", (req, res) => {
+app.post("/products", async (req, res) => {
   const {
     name,
     stock,
@@ -152,28 +115,32 @@ app.post("/products", (req, res) => {
     return res.status(400).json({ error: "Stock cannot be negative" });
   }
 
-  // Create new product with all fields
-  const newProduct = {
-    id: products.length > 0 ? Math.max(...products.map((p) => p.id)) + 1 : 1,
-    name,
-    stock: parseInt(stock),
-    eanCode: eanCode || "",
-    description: description || "",
-    category: category || "",
-    supplier: supplier || "",
-    price: price ? parseFloat(price) : 0,
-    minStock: minStock ? parseInt(minStock) : 0,
-  };
+  try {
+    const result = await pool.query(
+      `INSERT INTO products (name, stock, ean_code, description, category, supplier, price, min_stock)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        name,
+        parseInt(stock),
+        eanCode || "",
+        description || "",
+        category || "",
+        supplier || "",
+        price ? parseFloat(price) : 0,
+        minStock ? parseInt(minStock) : 0,
+      ],
+    );
 
-  // Add to products array
-  products.push(newProduct);
-
-  // Return the created product
-  res.status(201).json(newProduct);
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to create product" });
+  }
 });
 
-// PATCH /products/:id - updates a product's stock
-app.patch("/products/:id", (req, res) => {
+// PATCH /products/:id - updates a product
+app.patch("/products/:id", async (req, res) => {
   const productId = parseInt(req.params.id);
   const {
     stock,
@@ -186,32 +153,181 @@ app.patch("/products/:id", (req, res) => {
     minStock,
   } = req.body;
 
-  // Find the product
-  const product = products.find((p) => p.id === productId);
+  try {
+    // Build dynamic UPDATE query based on provided fields
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
 
-  // Check if product exists
-  if (!product) {
-    return res.status(404).json({ error: "Product not found" });
-  }
-
-  // Update fields (only if provided)
-  if (stock !== undefined) {
-    if (stock < 0) {
-      return res.status(400).json({ error: "Stock cannot be negative" });
+    if (stock !== undefined && stock !== "") {
+      const parsedStock = parseInt(stock);
+      if (isNaN(parsedStock) || parsedStock < 0) {
+        return res.status(400).json({ error: "Invalid stock value" });
+      }
+      updates.push(`stock = $${paramCount++}`);
+      values.push(parsedStock);
     }
-    product.stock = parseInt(stock);
+
+    if (name !== undefined && name !== "") {
+      updates.push(`name = $${paramCount++}`);
+      values.push(name);
+    }
+
+    if (eanCode !== undefined) {
+      updates.push(`ean_code = $${paramCount++}`);
+      values.push(eanCode || null);
+    }
+
+    if (description !== undefined) {
+      updates.push(`description = $${paramCount++}`);
+      values.push(description || null);
+    }
+
+    if (category !== undefined) {
+      updates.push(`category = $${paramCount++}`);
+      values.push(category || null);
+    }
+
+    if (supplier !== undefined) {
+      updates.push(`supplier = $${paramCount++}`);
+      values.push(supplier || null);
+    }
+
+    if (price !== undefined && price !== "") {
+      const parsedPrice = parseFloat(price);
+      if (isNaN(parsedPrice) || parsedPrice < 0) {
+        return res.status(400).json({ error: "Invalid price value" });
+      }
+      updates.push(`price = $${paramCount++}`);
+      values.push(parsedPrice);
+    }
+
+    if (minStock !== undefined && minStock !== "") {
+      const parsedMinStock = parseInt(minStock);
+      if (isNaN(parsedMinStock) || parsedMinStock < 0) {
+        return res.status(400).json({ error: "Invalid minStock value" });
+      }
+      updates.push(`min_stock = $${paramCount++}`);
+      values.push(parsedMinStock);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    // Add productId as the last parameter
+    values.push(productId);
+
+    const query = `
+      UPDATE products 
+      SET ${updates.join(", ")} 
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+
+    const result = await pool.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to update product" });
+  }
+});
+
+// GET /orders - returns list of all orders
+app.get("/orders", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM orders ORDER BY created_at DESC",
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+// POST /orders - creates a new order
+app.post("/orders", async (req, res) => {
+  const { productId, quantity, customerName } = req.body;
+
+  // Validation
+  if (!productId || !quantity || !customerName) {
+    return res
+      .status(400)
+      .json({ error: "Product ID, quantity, and customer name are required" });
   }
 
-  if (name !== undefined) product.name = name;
-  if (eanCode !== undefined) product.eanCode = eanCode;
-  if (description !== undefined) product.description = description;
-  if (category !== undefined) product.category = category;
-  if (supplier !== undefined) product.supplier = supplier;
-  if (price !== undefined) product.price = parseFloat(price);
-  if (minStock !== undefined) product.minStock = parseInt(minStock);
+  try {
+    // Start a transaction (ensures all-or-nothing: either order is created AND stock updated, or neither happens)
+    await pool.query("BEGIN");
 
-  // Send back the updated product
-  res.json(product);
+    // Find the product and lock it for update
+    const productResult = await pool.query(
+      "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+      [productId],
+    );
+
+    if (productResult.rows.length === 0) {
+      await pool.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const product = productResult.rows[0];
+
+    // Check stock
+    if (product.stock < quantity) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ error: "Insufficient stock" });
+    }
+
+    // Create the order
+    const orderResult = await pool.query(
+      `INSERT INTO orders (product_id, product_name, quantity, customer_name, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [productId, product.name, quantity, customerName, "pending"],
+    );
+
+    // Update product stock
+    await pool.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
+      quantity,
+      productId,
+    ]);
+
+    // Commit the transaction
+    await pool.query("COMMIT");
+
+    res.status(201).json(orderResult.rows[0]);
+  } catch (error) {
+    await pool.query("ROLLBACK");
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to create order" });
+  }
+});
+
+// PATCH /orders/:id - updates an order's status
+app.patch("/orders/:id", (req, res) => {
+  const orderId = parseInt(req.params.id); // Get order ID from URL
+  const { status } = req.body; // Get new status from request body
+
+  // Find the order
+  const order = orders.find((o) => o.id === orderId);
+
+  // Check if order exists
+  if (!order) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+
+  // Update the status
+  order.status = status;
+
+  // Send back the updated order
+  res.json(order);
 });
 
 // ===== WORKER ENDPOINTS =====
