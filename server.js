@@ -1,3 +1,6 @@
+// Load environment variables
+require('dotenv').config();
+
 // Import Express - the framework for building our web server
 const express = require("express");
 
@@ -9,11 +12,11 @@ const { Pool } = require("pg");
 
 // Database connection
 const pool = new Pool({
-  user: "postgres",
-  host: "localhost",
-  database: "order_management",
-  password: "+76edRFT(//!@ds", // ← Change this to your actual password
-  port: 5432,
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_DATABASE,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
 });
 
 // Test database connection
@@ -35,10 +38,41 @@ app.use(express.json());
 // This allows our React app (localhost:3001) to fetch data from this API (localhost:3000)
 app.use(cors());
 
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  const jwt = require("jsonwebtoken");
+  jwt.verify(
+    token,
+    process.env.JWT_SECRET,
+    (err, user) => {
+      if (err) {
+        return res.status(403).json({ error: "Invalid or expired token" });
+      }
+      req.user = user; // Add user info to request
+      next();
+    },
+  );
+};
+
+// GET /auth/verify - Verify if token is still valid
+app.get("/auth/verify", authenticateToken, (req, res) => {
+  res.json({
+    valid: true,
+    user: req.user,
+  });
+});
+
 // ===== API ENDPOINTS =====
 
 // GET /products - returns list of all products with current stock levels
-app.get("/products", async (req, res) => {
+app.get("/products", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM products ORDER BY id");
     res.json(result.rows);
@@ -49,7 +83,7 @@ app.get("/products", async (req, res) => {
 });
 
 // POST /products - creates a new product
-app.post("/products", async (req, res) => {
+app.post("/products", authenticateToken, async (req, res) => {
   const {
     name,
     stock,
@@ -95,7 +129,7 @@ app.post("/products", async (req, res) => {
 });
 
 // PATCH /products/:id - updates a product
-app.patch("/products/:id", async (req, res) => {
+app.patch("/products/:id", authenticateToken, async (req, res) => {
   const productId = parseInt(req.params.id);
   const {
     stock,
@@ -194,7 +228,7 @@ app.patch("/products/:id", async (req, res) => {
 });
 
 // GET /orders - returns list of all orders
-app.get("/orders", async (req, res) => {
+app.get("/orders", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM orders ORDER BY created_at DESC",
@@ -207,7 +241,7 @@ app.get("/orders", async (req, res) => {
 });
 
 // POST /orders - creates a new order
-app.post("/orders", async (req, res) => {
+app.post("/orders", authenticateToken, async (req, res) => {
   const { productId, quantity, customerName } = req.body;
 
   // Validation
@@ -266,7 +300,7 @@ app.post("/orders", async (req, res) => {
 });
 
 // PATCH /orders/:id - updates an order's status
-app.patch("/orders/:id", async (req, res) => {
+app.patch("/orders/:id", authenticateToken, async (req, res) => {
   const orderId = parseInt(req.params.id);
   const { status } = req.body;
 
@@ -294,7 +328,7 @@ app.patch("/orders/:id", async (req, res) => {
 // ===== WORKER ENDPOINTS =====
 
 // GET /workers - get all workers
-app.get("/workers", async (req, res) => {
+app.get("/workers", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM workers ORDER BY id");
     res.json(result.rows);
@@ -305,7 +339,7 @@ app.get("/workers", async (req, res) => {
 });
 
 // POST /workers - create a new worker
-app.post("/workers", async (req, res) => {
+app.post("/workers", authenticateToken, async (req, res) => {
   const { name, email, role, phone } = req.body;
 
   // Validation
@@ -340,7 +374,7 @@ app.post("/workers", async (req, res) => {
 });
 
 // PATCH /workers/:id - update a worker
-app.patch("/workers/:id", async (req, res) => {
+app.patch("/workers/:id", authenticateToken, async (req, res) => {
   const workerId = parseInt(req.params.id);
   const { name, email, role, phone, active } = req.body;
 
@@ -410,7 +444,7 @@ app.patch("/workers/:id", async (req, res) => {
 });
 
 // DELETE /workers/:id - delete a worker
-app.delete("/workers/:id", async (req, res) => {
+app.delete("/workers/:id", authenticateToken, async (req, res) => {
   const workerId = parseInt(req.params.id);
 
   try {
@@ -522,7 +556,7 @@ app.post("/auth/login", async (req, res) => {
         email: user.email,
         role: user.role,
       },
-      "your-secret-key-change-this-in-production", // TODO: Move to environment variable
+      process.env.JWT_SECRET,
       { expiresIn: "24h" },
     );
 
@@ -540,37 +574,6 @@ app.post("/auth/login", async (req, res) => {
     console.error("Database error:", error);
     res.status(500).json({ error: "Login failed" });
   }
-});
-
-// Middleware to verify JWT token
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
-
-  if (!token) {
-    return res.status(401).json({ error: "Access token required" });
-  }
-
-  const jwt = require("jsonwebtoken");
-  jwt.verify(
-    token,
-    "your-secret-key-change-this-in-production",
-    (err, user) => {
-      if (err) {
-        return res.status(403).json({ error: "Invalid or expired token" });
-      }
-      req.user = user; // Add user info to request
-      next();
-    },
-  );
-};
-
-// GET /auth/verify - Verify if token is still valid
-app.get("/auth/verify", authenticateToken, (req, res) => {
-  res.json({
-    valid: true,
-    user: req.user,
-  });
 });
 
 // Start the server and listen on port 3000
