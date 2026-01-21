@@ -35,51 +35,6 @@ app.use(express.json());
 // This allows our React app (localhost:3001) to fetch data from this API (localhost:3000)
 app.use(cors());
 
-// In-memory storage (data disappears when server restarts - we'll fix this with a database later)
-let orders = [];
-let products = [
-  {
-    id: 1,
-    name: "Widget A",
-    stock: 100,
-    eanCode: "8712345678901",
-    description: "High-quality widget for industrial use",
-    category: "Widgets",
-    supplier: "ABC Supplies",
-    price: 29.99,
-    minStock: 20,
-  },
-  {
-    id: 2,
-    name: "Widget B",
-    stock: 50,
-    eanCode: "8712345678902",
-    description: "Compact widget for light-duty applications",
-    category: "Widgets",
-    supplier: "XYZ Corp",
-    price: 19.99,
-    minStock: 10,
-  },
-];
-let workers = [
-  {
-    id: 1,
-    name: "John Smith",
-    email: "john@example.com",
-    role: "Picker",
-    phone: "555-0101",
-    active: true,
-  },
-  {
-    id: 2,
-    name: "Jane Doe",
-    email: "jane@example.com",
-    role: "Supervisor",
-    phone: "555-0102",
-    active: true,
-  },
-];
-
 // ===== API ENDPOINTS =====
 
 // GET /products - returns list of all products with current stock levels
@@ -350,7 +305,7 @@ app.get("/workers", async (req, res) => {
 });
 
 // POST /workers - create a new worker
-app.post("/workers", (req, res) => {
+app.post("/workers", async (req, res) => {
   const { name, email, role, phone } = req.body;
 
   // Validation
@@ -358,63 +313,264 @@ app.post("/workers", (req, res) => {
     return res.status(400).json({ error: "Name and email are required" });
   }
 
-  // Check if email already exists
-  if (workers.find((w) => w.email === email)) {
-    return res.status(400).json({ error: "Email already exists" });
+  try {
+    // Check if email already exists
+    const existingWorker = await pool.query(
+      "SELECT * FROM workers WHERE email = $1",
+      [email],
+    );
+
+    if (existingWorker.rows.length > 0) {
+      return res.status(400).json({ error: "Email already exists" });
+    }
+
+    // Create new worker
+    const result = await pool.query(
+      `INSERT INTO workers (name, email, role, phone, active)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [name, email, role || "Picker", phone || "", true],
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to create worker" });
   }
-
-  const newWorker = {
-    id: workers.length > 0 ? Math.max(...workers.map((w) => w.id)) + 1 : 1,
-    name,
-    email,
-    role: role || "Picker",
-    phone: phone || "",
-    active: true,
-  };
-
-  workers.push(newWorker);
-  res.status(201).json(newWorker);
 });
 
 // PATCH /workers/:id - update a worker
-app.patch("/workers/:id", (req, res) => {
+app.patch("/workers/:id", async (req, res) => {
   const workerId = parseInt(req.params.id);
   const { name, email, role, phone, active } = req.body;
 
-  const worker = workers.find((w) => w.id === workerId);
+  try {
+    // Check if email is being changed and if it already exists
+    if (email) {
+      const existingWorker = await pool.query(
+        "SELECT * FROM workers WHERE email = $1 AND id != $2",
+        [email, workerId],
+      );
 
-  if (!worker) {
-    return res.status(404).json({ error: "Worker not found" });
-  }
-
-  // Check email uniqueness if changing email
-  if (email && email !== worker.email) {
-    if (workers.find((w) => w.email === email && w.id !== workerId)) {
-      return res.status(400).json({ error: "Email already exists" });
+      if (existingWorker.rows.length > 0) {
+        return res.status(400).json({ error: "Email already exists" });
+      }
     }
+
+    // Build dynamic UPDATE query
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramCount++}`);
+      values.push(name);
+    }
+    if (email !== undefined) {
+      updates.push(`email = $${paramCount++}`);
+      values.push(email);
+    }
+    if (role !== undefined) {
+      updates.push(`role = $${paramCount++}`);
+      values.push(role);
+    }
+    if (phone !== undefined) {
+      updates.push(`phone = $${paramCount++}`);
+      values.push(phone);
+    }
+    if (active !== undefined) {
+      updates.push(`active = $${paramCount++}`);
+      values.push(active);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    values.push(workerId);
+
+    const query = `
+      UPDATE workers 
+      SET ${updates.join(", ")}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+
+    const result = await pool.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Worker not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to update worker" });
   }
-
-  // Update fields
-  if (name !== undefined) worker.name = name;
-  if (email !== undefined) worker.email = email;
-  if (role !== undefined) worker.role = role;
-  if (phone !== undefined) worker.phone = phone;
-  if (active !== undefined) worker.active = active;
-
-  res.json(worker);
 });
 
 // DELETE /workers/:id - delete a worker
-app.delete("/workers/:id", (req, res) => {
+app.delete("/workers/:id", async (req, res) => {
   const workerId = parseInt(req.params.id);
-  const index = workers.findIndex((w) => w.id === workerId);
 
-  if (index === -1) {
-    return res.status(404).json({ error: "Worker not found" });
+  try {
+    const result = await pool.query(
+      "DELETE FROM workers WHERE id = $1 RETURNING *",
+      [workerId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Worker not found" });
+    }
+
+    res.json({ message: "Worker deleted successfully", id: workerId });
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to delete worker" });
+  }
+});
+
+// ===== AUTHENTICATION ENDPOINTS =====
+
+// POST /auth/register - Create new user account
+app.post("/auth/register", async (req, res) => {
+  const { username, email, password, role } = req.body;
+
+  // Validation
+  if (!username || !email || !password) {
+    return res
+      .status(400)
+      .json({ error: "Username, email, and password are required" });
   }
 
-  workers.splice(index, 1);
-  res.json({ message: "Worker deleted successfully", id: workerId });
+  if (password.length < 9) {
+    return res
+      .status(400)
+      .json({ error: "Password must be at least 9 characters" });
+  }
+
+  try {
+    // Check if user already exists
+    const existingUser = await pool.query(
+      "SELECT * FROM users WHERE email = $1 OR username = $2",
+      [email, username],
+    );
+
+    if (existingUser.rows.length > 0) {
+      return res
+        .status(400)
+        .json({ error: "Email or username already exists" });
+    }
+
+    // Hash the password
+    const bcrypt = require("bcryptjs");
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create user
+    const result = await pool.query(
+      `INSERT INTO users (username, email, password_hash, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, username, email, role, created_at`,
+      [username, email, passwordHash, role || "user"],
+    );
+
+    res.status(201).json({
+      message: "User created successfully",
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to create user" });
+  }
+});
+
+// POST /auth/login - Login user
+app.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  // Validation
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  try {
+    // Find user
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [
+      email,
+    ]);
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    const user = result.rows[0];
+
+    // Check password
+    const bcrypt = require("bcryptjs");
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+
+    if (!validPassword) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    // Create JWT token
+    const jwt = require("jsonwebtoken");
+    const token = jwt.sign(
+      {
+        userId: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+      },
+      "your-secret-key-change-this-in-production", // TODO: Move to environment variable
+      { expiresIn: "24h" },
+    );
+
+    res.json({
+      message: "Login successful",
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  const jwt = require("jsonwebtoken");
+  jwt.verify(
+    token,
+    "your-secret-key-change-this-in-production",
+    (err, user) => {
+      if (err) {
+        return res.status(403).json({ error: "Invalid or expired token" });
+      }
+      req.user = user; // Add user info to request
+      next();
+    },
+  );
+};
+
+// GET /auth/verify - Verify if token is still valid
+app.get("/auth/verify", authenticateToken, (req, res) => {
+  res.json({
+    valid: true,
+    user: req.user,
+  });
 });
 
 // Start the server and listen on port 3000
