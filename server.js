@@ -61,6 +61,21 @@ const authenticateToken = (req, res, next) => {
   );
 };
 
+// Middleware to check if user has required role
+const requireRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    
+    next();
+  };
+};
+
 // GET /auth/verify - Verify if token is still valid
 app.get("/auth/verify", authenticateToken, (req, res) => {
   res.json({
@@ -107,7 +122,7 @@ app.post("/products", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO products (name, stock, ean_code, description, category, supplier, price, min_stock)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
         name,
@@ -461,6 +476,184 @@ app.delete("/workers/:id", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("Database error:", error);
     res.status(500).json({ error: "Failed to delete worker" });
+  }
+});
+
+// ===== CUSTOMER ENDPOINTS =====
+
+// GET /customers - Get all customers
+app.get('/customers', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM customers ORDER BY name');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+// POST /customers - Create new customer
+app.post('/customers', authenticateToken, async (req, res) => {
+  const { name, email, phone, company, address } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ error: 'Customer name is required' });
+  }
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO customers (name, email, phone, company, address)
+      VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [name, email || null, phone || null, company || null, address || null]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Failed to create customer' });
+  }
+});
+
+// PATCH /customers/:id - Update customer
+app.patch('/customers/:id', authenticateToken, async (req, res) => {
+  const customerId = parseInt(req.params.id);
+  const { name, email, phone, company, address } = req.body;
+  
+  try {
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+    
+    if (name !== undefined) {
+      updates.push(`name = $${paramCount++}`);
+      values.push(name);
+    }
+    if (email !== undefined) {
+      updates.push(`email = $${paramCount++}`);
+      values.push(email);
+    }
+    if (phone !== undefined) {
+      updates.push(`phone = $${paramCount++}`);
+      values.push(phone);
+    }
+    if (company !== undefined) {
+      updates.push(`company = $${paramCount++}`);
+      values.push(company);
+    }
+    if (address !== undefined) {
+      updates.push(`address = $${paramCount++}`);
+      values.push(address);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    values.push(customerId);
+    
+    const query = `
+      UPDATE customers 
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, values);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Failed to update customer' });
+  }
+});
+
+// ===== USER MANAGEMENT ENDPOINTS (Admin only) =====
+
+// GET /users - Get all users (admin only)
+app.get('/users', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, username, email, role, created_at FROM users ORDER BY id'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// PATCH /users/:id - Update user (admin only)
+app.patch('/users/:id', authenticateToken, requireRole('admin'), async (req, res) => {
+  const userId = parseInt(req.params.id);
+  const { username, email, role } = req.body;
+  
+  try {
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+    
+    if (username !== undefined) {
+      updates.push(`username = $${paramCount++}`);
+      values.push(username);
+    }
+    if (email !== undefined) {
+      updates.push(`email = $${paramCount++}`);
+      values.push(email);
+    }
+    if (role !== undefined) {
+      updates.push(`role = $${paramCount++}`);
+      values.push(role);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    values.push(userId);
+    
+    const query = `
+      UPDATE users 
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING id, username, email, role, created_at
+    `;
+    
+    const result = await pool.query(query, values);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// DELETE /users/:id - Delete user (admin only)
+app.delete('/users/:id', authenticateToken, requireRole('admin'), async (req, res) => {
+  const userId = parseInt(req.params.id);
+  
+  try {
+    const result = await pool.query(
+      'DELETE FROM users WHERE id = $1 RETURNING id',
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({ message: 'User deleted successfully', id: userId });
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
   }
 });
 
