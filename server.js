@@ -1,5 +1,5 @@
 // Load environment variables
-require('dotenv').config();
+require("dotenv").config();
 
 // Import Express - the framework for building our web server
 const express = require("express");
@@ -48,30 +48,26 @@ const authenticateToken = (req, res, next) => {
   }
 
   const jwt = require("jsonwebtoken");
-  jwt.verify(
-    token,
-    process.env.JWT_SECRET,
-    (err, user) => {
-      if (err) {
-        return res.status(403).json({ error: "Invalid or expired token" });
-      }
-      req.user = user; // Add user info to request
-      next();
-    },
-  );
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: "Invalid or expired token" });
+    }
+    req.user = user; // Add user info to request
+    next();
+  });
 };
 
 // Middleware to check if user has required role
 const requireRole = (...allowedRoles) => {
   return (req, res, next) => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
+      return res.status(401).json({ error: "Authentication required" });
     }
-    
+
     if (!allowedRoles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
+      return res.status(403).json({ error: "Insufficient permissions" });
     }
-    
+
     next();
   };
 };
@@ -245,72 +241,193 @@ app.patch("/products/:id", authenticateToken, async (req, res) => {
 // GET /orders - returns list of all orders
 app.get("/orders", authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM orders ORDER BY created_at DESC",
-    );
-    res.json(result.rows);
+    const ordersResult = await pool.query(`
+      SELECT 
+        o.id,
+        o.customer_id,
+        o.status,
+        o.created_at,
+        c.name as customer_name,
+        c.email as customer_email,
+        c.company as customer_company
+      FROM orders o
+      LEFT JOIN customers c ON o.customer_id = c.id
+      ORDER BY o.created_at DESC
+    `);
+
+    // Get all order items
+    const itemsResult = await pool.query(`
+      SELECT 
+        oi.*
+      FROM order_items oi
+      ORDER BY oi.order_id, oi.id
+    `);
+
+    // Group items by order_id
+    const itemsByOrder = {};
+    itemsResult.rows.forEach((item) => {
+      if (!itemsByOrder[item.order_id]) {
+        itemsByOrder[item.order_id] = [];
+      }
+      itemsByOrder[item.order_id].push(item);
+    });
+
+    // Combine orders with their items
+    const ordersWithItems = ordersResult.rows.map((order) => ({
+      ...order,
+      items: itemsByOrder[order.id] || [],
+    }));
+
+    res.json(ordersWithItems);
   } catch (error) {
     console.error("Database error:", error);
     res.status(500).json({ error: "Failed to fetch orders" });
   }
 });
 
-// POST /orders - creates a new order
+// POST /orders - creates a new order with multiple items
 app.post("/orders", authenticateToken, async (req, res) => {
-  const { productId, quantity, customerName } = req.body;
+  const { customerId, items } = req.body;
 
   // Validation
-  if (!productId || !quantity || !customerName) {
+  if (!customerId || !items || !Array.isArray(items) || items.length === 0) {
     return res
       .status(400)
-      .json({ error: "Product ID, quantity, and customer name are required" });
+      .json({ error: "Customer ID and at least one item are required" });
   }
 
   try {
     // Start a transaction (ensures all-or-nothing: either order is created AND stock updated, or neither happens)
     await pool.query("BEGIN");
 
-    // Find the product and lock it for update
-    const productResult = await pool.query(
-      "SELECT * FROM products WHERE id = $1 FOR UPDATE",
-      [productId],
+    // Verify customer exists
+    const customerResult = await pool.query(
+      "SELECT * FROM customers WHERE id = $1",
+      [customerId],
     );
 
-    if (productResult.rows.length === 0) {
+    if (customerResult.rows.length === 0) {
       await pool.query("ROLLBACK");
-      return res.status(404).json({ error: "Product not found" });
+      return res.status(404).json({ error: "Customer not found" });
     }
 
-    const product = productResult.rows[0];
-
-    // Check stock
-    if (product.stock < quantity) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ error: "Insufficient stock" });
-    }
+    const customer = customerResult.rows[0];
 
     // Create the order
     const orderResult = await pool.query(
-      `INSERT INTO orders (product_id, product_name, quantity, customer_name, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO orders (customer_id, customer_name, status, created_at)
+       VALUES ($1, $2, $3, NOW())
        RETURNING *`,
-      [productId, product.name, quantity, customerName, "pending"],
+      [customerId, customer.name, "pending"],
     );
 
-    // Update product stock
-    await pool.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
-      quantity,
-      productId,
-    ]);
+    const order = orderResult.rows[0];
 
-    // Commit the transaction
+    // Process each item
+    const orderItems = [];
+    for (const item of items) {
+      const { productId, quantity } = item;
+
+      if (!productId || !quantity || quantity <= 0) {
+        await pool.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ error: "Invalid item: productId and quantity > 0 required" });
+      }
+
+      // Get product and lock for update
+      const productResult = await pool.query(
+        "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+        [productId],
+      );
+
+      if (productResult.rows.length === 0) {
+        await pool.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ error: `Product not found: ${productId}` });
+      }
+
+      const product = productResult.rows[0];
+
+      // Check stock
+      if (product.stock < quantity) {
+        await pool.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Insufficient stock for ${product.name}. Available: ${product.stock}, Requested: ${quantity}`,
+        });
+      }
+
+      // Create order item
+      const itemResult = await pool.query(
+        `INSERT INTO order_items (order_id, product_id, product_name, quantity, price_at_order, created_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        RETURNING *`,
+        [order.id, productId, product.name, quantity, product.price || 0],
+      );
+
+      orderItems.push(itemResult.rows[0]);
+
+      // Update product stock
+      await pool.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
+        quantity,
+        productId,
+      ]);
+    }
+
     await pool.query("COMMIT");
 
-    res.status(201).json(orderResult.rows[0]);
+    // Return order with items
+    res.status(201).json({
+      ...order,
+      items: orderItems,
+    });
   } catch (error) {
     await pool.query("ROLLBACK");
     console.error("Database error:", error);
     res.status(500).json({ error: "Failed to create order" });
+  }
+});
+
+// GET /orders/:id - get single order with items
+app.get("/orders/:id", authenticateToken, async (req, res) => {
+  const orderId = parseInt(req.params.id);
+
+  try {
+    // Get order
+    const orderResult = await pool.query(
+      `
+      SELECT 
+        o.*,
+        c.name as customer_name,
+        c.email as customer_email,
+        c.company as customer_company
+      FROM orders o
+      LEFT JOIN customers c ON o.customer_id = c.id
+      WHERE o.id = $1
+    `,
+      [orderId],
+    );
+
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    // Get order items
+    const itemsResult = await pool.query(
+      `
+      SELECT * FROM order_items WHERE order_id = $1 ORDER BY id
+    `,
+      [orderId],
+    );
+
+    res.json({
+      ...orderResult.rows[0],
+      items: itemsResult.rows,
+    });
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch order" });
   }
 });
 
@@ -345,7 +462,15 @@ app.patch("/orders/:id", authenticateToken, async (req, res) => {
 // GET /workers - get all workers
 app.get("/workers", authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM workers ORDER BY id");
+    const result = await pool.query(`
+      SELECT 
+        w.*,
+        u.username,
+        u.email as user_email
+      FROM workers w
+      LEFT JOIN users u ON w.user_id = u.id
+      ORDER BY w.id
+    `);
     res.json(result.rows);
   } catch (error) {
     console.error("Database error:", error);
@@ -355,7 +480,7 @@ app.get("/workers", authenticateToken, async (req, res) => {
 
 // POST /workers - create a new worker
 app.post("/workers", authenticateToken, async (req, res) => {
-  const { name, email, role, phone } = req.body;
+  const { name, email, role, phone, userId } = req.body;
 
   // Validation
   if (!name || !email) {
@@ -373,12 +498,35 @@ app.post("/workers", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Email already exists" });
     }
 
+    // If userId provided, verify user exists and isn't already linked
+    if (userId) {
+      const userCheck = await pool.query("SELECT * FROM users WHERE id = $1", [
+        userId,
+      ]);
+
+      if (userCheck.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Check if user is already linked to another worker
+      const existingLink = await pool.query(
+        "SELECT * FROM workers WHERE user_id = $1",
+        [userId],
+      );
+
+      if (existingLink.rows.length > 0) {
+        return res
+          .status(400)
+          .json({ error: "User already linked to another worker" });
+      }
+    }
+
     // Create new worker
     const result = await pool.query(
-      `INSERT INTO workers (name, email, role, phone, active)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO workers (name, email, role, phone, active, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [name, email, role || "Picker", phone || "", true],
+      [name, email, role || "Picker", phone || "", true, userId || null],
     );
 
     res.status(201).json(result.rows[0]);
@@ -391,7 +539,7 @@ app.post("/workers", authenticateToken, async (req, res) => {
 // PATCH /workers/:id - update a worker
 app.patch("/workers/:id", authenticateToken, async (req, res) => {
   const workerId = parseInt(req.params.id);
-  const { name, email, role, phone, active } = req.body;
+  const { name, email, role, phone, active, userId } = req.body;
 
   try {
     // Check if email is being changed and if it already exists
@@ -403,6 +551,29 @@ app.patch("/workers/:id", authenticateToken, async (req, res) => {
 
       if (existingWorker.rows.length > 0) {
         return res.status(400).json({ error: "Email already exists" });
+      }
+    }
+
+    // If userId is being changed, verify user exists and isn't already linked
+    if (userId !== undefined && userId !== null) {
+      const userCheck = await pool.query("SELECT * FROM users WHERE id = $1", [
+        userId,
+      ]);
+
+      if (userCheck.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Check if user is already linked to another worker
+      const existingLink = await pool.query(
+        "SELECT * FROM workers WHERE user_id = $1 AND id != $2",
+        [userId, workerId],
+      );
+
+      if (existingLink.rows.length > 0) {
+        return res
+          .status(400)
+          .json({ error: "User already linked to another worker" });
       }
     }
 
@@ -431,6 +602,11 @@ app.patch("/workers/:id", authenticateToken, async (req, res) => {
       updates.push(`active = $${paramCount++}`);
       values.push(active);
     }
+    if (userId !== undefined) {
+      // Allow setting to null to unlink
+      updates.push(`user_id = $${paramCount++}`);
+      values.push(userId);
+    }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: "No fields to update" });
@@ -445,7 +621,21 @@ app.patch("/workers/:id", authenticateToken, async (req, res) => {
       RETURNING *
     `;
 
-    const result = await pool.query(query, values);
+    await pool.query(query, values);
+
+    // Fetch the updated worker WITH user info (using JOIN)
+    const result = await pool.query(
+      `
+      SELECT 
+        w.*,
+        u.username,
+        u.email as user_email
+      FROM workers w
+      LEFT JOIN users u ON w.user_id = u.id
+      WHERE w.id = $1
+    `,
+      [workerId],
+    );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Worker not found" });
@@ -459,72 +649,159 @@ app.patch("/workers/:id", authenticateToken, async (req, res) => {
 });
 
 // DELETE /workers/:id - delete a worker
-app.delete("/workers/:id", authenticateToken, async (req, res) => {
-  const workerId = parseInt(req.params.id);
+app.delete(
+  "/workers/:id",
+  authenticateToken,
+  requireRole("admin"),
+  async (req, res) => {
+    const userId = parseInt(req.params.id);
 
-  try {
-    const result = await pool.query(
-      "DELETE FROM workers WHERE id = $1 RETURNING *",
-      [workerId],
-    );
+    try {
+      // Check if user is linked to a worker
+      const linkedWorker = await pool.query(
+        "SELECT * FROM workers WHERE user_id = $1",
+        [userId],
+      );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Worker not found" });
+      if (linkedWorker.rows.length > 0) {
+        return res.status(400).json({
+          error: `Cannot delete user. Linked to worker: ${linkedWorker.rows[0].name}. Unlink the worker first.`,
+        });
+      }
+
+      const result = await pool.query(
+        "DELETE FROM users WHERE id = $1 RETURNING id",
+        [userId],
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      res.json({ message: "User deleted successfully", id: userId });
+    } catch (error) {
+      console.error("Database error:", error);
+      res.status(500).json({ error: "Failed to delete user" });
     }
-
-    res.json({ message: "Worker deleted successfully", id: workerId });
-  } catch (error) {
-    console.error("Database error:", error);
-    res.status(500).json({ error: "Failed to delete worker" });
-  }
-});
+  },
+);
 
 // ===== CUSTOMER ENDPOINTS =====
 
 // GET /customers - Get all customers
-app.get('/customers', authenticateToken, async (req, res) => {
+app.get("/customers", authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM customers ORDER BY name');
+    const result = await pool.query("SELECT * FROM customers ORDER BY name");
     res.json(result.rows);
   } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Failed to fetch customers' });
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch customers" });
+  }
+});
+
+// GET /customers/:id/orders - Get all orders for a specific customer
+app.get("/customers/:id/orders", authenticateToken, async (req, res) => {
+  const customerId = parseInt(req.params.id);
+
+  try {
+    // Get customer info
+    const customerResult = await pool.query(
+      "SELECT * FROM customers WHERE id = $1",
+      [customerId],
+    );
+
+    if (customerResult.rows.length === 0) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
+    // Get all orders for this customer
+    const ordersResult = await pool.query(
+      `
+      SELECT 
+        o.*
+      FROM orders o
+      WHERE o.customer_id = $1
+      ORDER BY o.created_at DESC
+    `,
+      [customerId],
+    );
+
+    // Get order items for all these orders
+    if (ordersResult.rows.length > 0) {
+      const orderIds = ordersResult.rows.map((o) => o.id);
+      const itemsResult = await pool.query(
+        `
+        SELECT * FROM order_items 
+        WHERE order_id = ANY($1)
+        ORDER BY order_id, id
+      `,
+        [orderIds],
+      );
+
+      // Group items by order_id
+      const itemsByOrder = {};
+      itemsResult.rows.forEach((item) => {
+        if (!itemsByOrder[item.order_id]) {
+          itemsByOrder[item.order_id] = [];
+        }
+        itemsByOrder[item.order_id].push(item);
+      });
+
+      // Combine orders with their items
+      const ordersWithItems = ordersResult.rows.map((order) => ({
+        ...order,
+        items: itemsByOrder[order.id] || [],
+      }));
+
+      res.json({
+        customer: customerResult.rows[0],
+        orders: ordersWithItems,
+      });
+    } else {
+      res.json({
+        customer: customerResult.rows[0],
+        orders: [],
+      });
+    }
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch customer orders" });
   }
 });
 
 // POST /customers - Create new customer
-app.post('/customers', authenticateToken, async (req, res) => {
+app.post("/customers", authenticateToken, async (req, res) => {
   const { name, email, phone, company, address } = req.body;
-  
+
   if (!name) {
-    return res.status(400).json({ error: 'Customer name is required' });
+    return res.status(400).json({ error: "Customer name is required" });
   }
-  
+
   try {
     const result = await pool.query(
       `INSERT INTO customers (name, email, phone, company, address)
       VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [name, email || null, phone || null, company || null, address || null]
+      [name, email || null, phone || null, company || null, address || null],
     );
-    
+
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Failed to create customer' });
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to create customer" });
   }
 });
 
 // PATCH /customers/:id - Update customer
-app.patch('/customers/:id', authenticateToken, async (req, res) => {
+app.patch("/customers/:id", authenticateToken, async (req, res) => {
   const customerId = parseInt(req.params.id);
   const { name, email, phone, company, address } = req.body;
-  
+
   try {
     const updates = [];
     const values = [];
     let paramCount = 1;
-    
+
     if (name !== undefined) {
       updates.push(`name = $${paramCount++}`);
       values.push(name);
@@ -545,117 +822,127 @@ app.patch('/customers/:id', authenticateToken, async (req, res) => {
       updates.push(`address = $${paramCount++}`);
       values.push(address);
     }
-    
+
     if (updates.length === 0) {
-      return res.status(400).json({ error: 'No fields to update' });
+      return res.status(400).json({ error: "No fields to update" });
     }
-    
+
     values.push(customerId);
-    
+
     const query = `
       UPDATE customers 
-      SET ${updates.join(', ')}
+      SET ${updates.join(", ")}
       WHERE id = $${paramCount}
       RETURNING *
     `;
-    
+
     const result = await pool.query(query, values);
-    
+
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Customer not found' });
+      return res.status(404).json({ error: "Customer not found" });
     }
-    
+
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Failed to update customer' });
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to update customer" });
   }
 });
 
 // ===== USER MANAGEMENT ENDPOINTS (Admin only) =====
 
 // GET /users - Get all users (admin only)
-app.get('/users', authenticateToken, requireRole('admin'), async (req, res) => {
+app.get("/users", authenticateToken, requireRole("admin"), async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, username, email, role, created_at FROM users ORDER BY id'
+      "SELECT id, username, email, role, created_at FROM users ORDER BY id",
     );
     res.json(result.rows);
   } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Failed to fetch users' });
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch users" });
   }
 });
 
 // PATCH /users/:id - Update user (admin only)
-app.patch('/users/:id', authenticateToken, requireRole('admin'), async (req, res) => {
-  const userId = parseInt(req.params.id);
-  const { username, email, role } = req.body;
-  
-  try {
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
-    
-    if (username !== undefined) {
-      updates.push(`username = $${paramCount++}`);
-      values.push(username);
-    }
-    if (email !== undefined) {
-      updates.push(`email = $${paramCount++}`);
-      values.push(email);
-    }
-    if (role !== undefined) {
-      updates.push(`role = $${paramCount++}`);
-      values.push(role);
-    }
-    
-    if (updates.length === 0) {
-      return res.status(400).json({ error: 'No fields to update' });
-    }
-    
-    values.push(userId);
-    
-    const query = `
+app.patch(
+  "/users/:id",
+  authenticateToken,
+  requireRole("admin"),
+  async (req, res) => {
+    const userId = parseInt(req.params.id);
+    const { username, email, role } = req.body;
+
+    try {
+      const updates = [];
+      const values = [];
+      let paramCount = 1;
+
+      if (username !== undefined) {
+        updates.push(`username = $${paramCount++}`);
+        values.push(username);
+      }
+      if (email !== undefined) {
+        updates.push(`email = $${paramCount++}`);
+        values.push(email);
+      }
+      if (role !== undefined) {
+        updates.push(`role = $${paramCount++}`);
+        values.push(role);
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({ error: "No fields to update" });
+      }
+
+      values.push(userId);
+
+      const query = `
       UPDATE users 
-      SET ${updates.join(', ')}
+      SET ${updates.join(", ")}
       WHERE id = $${paramCount}
       RETURNING id, username, email, role, created_at
     `;
-    
-    const result = await pool.query(query, values);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+
+      const result = await pool.query(query, values);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error("Database error:", error);
+      res.status(500).json({ error: "Failed to update user" });
     }
-    
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Failed to update user' });
-  }
-});
+  },
+);
 
 // DELETE /users/:id - Delete user (admin only)
-app.delete('/users/:id', authenticateToken, requireRole('admin'), async (req, res) => {
-  const userId = parseInt(req.params.id);
-  
-  try {
-    const result = await pool.query(
-      'DELETE FROM users WHERE id = $1 RETURNING id',
-      [userId]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+app.delete(
+  "/users/:id",
+  authenticateToken,
+  requireRole("admin"),
+  async (req, res) => {
+    const userId = parseInt(req.params.id);
+
+    try {
+      const result = await pool.query(
+        "DELETE FROM users WHERE id = $1 RETURNING id",
+        [userId],
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      res.json({ message: "User deleted successfully", id: userId });
+    } catch (error) {
+      console.error("Database error:", error);
+      res.status(500).json({ error: "Failed to delete user" });
     }
-    
-    res.json({ message: 'User deleted successfully', id: userId });
-  } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Failed to delete user' });
-  }
-});
+  },
+);
 
 // ===== AUTHENTICATION ENDPOINTS =====
 
