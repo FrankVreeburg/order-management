@@ -10,6 +10,49 @@ const cors = require("cors");
 // Connect to Database PG
 const { Pool } = require("pg");
 
+// Import multer for file uploads
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+
+// Configure multer for logo uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = "./uploads/logos";
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Generate unique filename: logo-timestamp.extension
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, "logo-" + uniqueSuffix + path.extname(file.originalname));
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: function (req, file, cb) {
+    // Only allow images
+    const allowedTypes = /jpeg|jpg|png|gif|svg/;
+    const extname = allowedTypes.test(
+      path.extname(file.originalname).toLowerCase(),
+    );
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error("Only image files are allowed (jpeg, jpg, png, gif, svg)"));
+    }
+  },
+});
+
 // Database connection
 const pool = new Pool({
   user: process.env.DB_USER,
@@ -37,6 +80,9 @@ app.use(express.json());
 // Middleware: enables Cross-Origin Resource Sharing
 // This allows our React app (localhost:3001) to fetch data from this API (localhost:3000)
 app.use(cors());
+
+// Serve static files from uploads directory
+app.use("/uploads", express.static("uploads"));
 
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
@@ -242,16 +288,25 @@ app.patch("/products/:id", authenticateToken, async (req, res) => {
 app.get("/orders", authenticateToken, async (req, res) => {
   try {
     const ordersResult = await pool.query(`
-      SELECT 
+     SELECT 
         o.id,
         o.customer_id,
         o.status,
         o.created_at,
+        o.assigned_picker_id,
+        o.assigned_packer_id,
+        o.picked_at,
+        o.packed_at,
+        o.shipped_at,
         c.name as customer_name,
         c.email as customer_email,
-        c.company as customer_company
+        c.company as customer_company,
+        wp.name as picker_name,
+        wpack.name as packer_name
       FROM orders o
       LEFT JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN workers wp ON o.assigned_picker_id = wp.id
+      LEFT JOIN workers wpack ON o.assigned_packer_id = wpack.id
       ORDER BY o.created_at DESC
     `);
 
@@ -401,9 +456,17 @@ app.get("/orders/:id", authenticateToken, async (req, res) => {
         o.*,
         c.name as customer_name,
         c.email as customer_email,
-        c.company as customer_company
+        c.company as customer_company,
+        c.phone as customer_phone,
+        c.address as customer_address,
+        wp.name as picker_name,
+        wp.email as picker_email,
+        wpack.name as packer_name,
+        wpack.email as packer_email
       FROM orders o
       LEFT JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN workers wp ON o.assigned_picker_id = wp.id
+      LEFT JOIN workers wpack ON o.assigned_packer_id = wpack.id
       WHERE o.id = $1
     `,
       [orderId],
@@ -434,28 +497,331 @@ app.get("/orders/:id", authenticateToken, async (req, res) => {
 // PATCH /orders/:id - updates an order's status
 app.patch("/orders/:id", authenticateToken, async (req, res) => {
   const orderId = parseInt(req.params.id);
-  const { status } = req.body;
-
-  if (!status) {
-    return res.status(400).json({ error: "Status is required" });
-  }
+  const { status, assignedPickerId, assignedPackerId } = req.body;
 
   try {
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    // Update status
+    if (status !== undefined) {
+      updates.push(`status = $${paramCount++}`);
+      values.push(status);
+
+      // Set timestamps based on status
+      if (status === "picked") {
+        updates.push(`picked_at = NOW()`);
+      } else if (status === "packed") {
+        updates.push(`packed_at = NOW()`);
+      } else if (status === "shipped") {
+        updates.push(`shipped_at = NOW()`);
+      }
+    }
+
+    // Assign picker
+    if (assignedPickerId !== undefined) {
+      updates.push(`assigned_picker_id = $${paramCount++}`);
+      values.push(assignedPickerId);
+    }
+
+    // Assign packer
+    if (assignedPackerId !== undefined) {
+      updates.push(`assigned_packer_id = $${paramCount++}`);
+      values.push(assignedPackerId);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    values.push(orderId);
+
+    const query = `
+      UPDATE orders 
+      SET ${updates.join(", ")}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+
+    await pool.query(query, values);
+
+    // Fetch the updated order with all JOIN data
     const result = await pool.query(
-      "UPDATE orders SET status = $1 WHERE id = $2 RETURNING *",
-      [status, orderId],
+      `
+      SELECT 
+        o.*,
+        c.name as customer_name,
+        c.email as customer_email,
+        c.company as customer_company,
+        wp.name as picker_name,
+        wpack.name as packer_name
+      FROM orders o
+      LEFT JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN workers wp ON o.assigned_picker_id = wp.id
+      LEFT JOIN workers wpack ON o.assigned_packer_id = wpack.id
+      WHERE o.id = $1
+    `,
+      [orderId],
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    res.json(result.rows[0]);
+    // Get items
+    const itemsResult = await pool.query(
+      `
+      SELECT * FROM order_items WHERE order_id = $1 ORDER BY id
+    `,
+      [orderId],
+    );
+
+    res.json({
+      ...result.rows[0],
+      items: itemsResult.rows,
+    });
   } catch (error) {
     console.error("Database error:", error);
     res.status(500).json({ error: "Failed to update order" });
   }
 });
+
+// POST /orders/:id/items - Add item to existing order (only if pending)
+app.post("/orders/:id/items", authenticateToken, async (req, res) => {
+  const orderId = parseInt(req.params.id);
+  const { productId, quantity } = req.body;
+
+  if (!productId || !quantity || quantity <= 0) {
+    return res
+      .status(400)
+      .json({ error: "Product ID and quantity > 0 required" });
+  }
+
+  try {
+    await pool.query("BEGIN");
+
+    // Check order exists and is pending
+    const orderCheck = await pool.query("SELECT * FROM orders WHERE id = $1", [
+      orderId,
+    ]);
+
+    if (orderCheck.rows.length === 0) {
+      await pool.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    if (orderCheck.rows[0].status !== "pending") {
+      await pool.query("ROLLBACK");
+      return res
+        .status(400)
+        .json({ error: "Can only add items to pending orders" });
+    }
+
+    // Get product and check stock
+    const productResult = await pool.query(
+      "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+      [productId],
+    );
+
+    if (productResult.rows.length === 0) {
+      await pool.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const product = productResult.rows[0];
+
+    if (product.stock < quantity) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({
+        error: `Insufficient stock. Available: ${product.stock}`,
+      });
+    }
+
+    // Add item to order
+    const itemResult = await pool.query(
+      `INSERT INTO order_items (order_id, product_id, product_name, quantity, price_at_order)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [orderId, productId, product.name, quantity, product.price || 0],
+    );
+
+    // Update product stock
+    await pool.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
+      quantity,
+      productId,
+    ]);
+
+    await pool.query("COMMIT");
+
+    res.status(201).json(itemResult.rows[0]);
+  } catch (error) {
+    await pool.query("ROLLBACK");
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to add item to order" });
+  }
+});
+
+// PATCH /orders/:orderId/items/:itemId - Update item quantity (only if pending)
+app.patch(
+  "/orders/:orderId/items/:itemId",
+  authenticateToken,
+  async (req, res) => {
+    const orderId = parseInt(req.params.orderId);
+    const itemId = parseInt(req.params.itemId);
+    const { quantity } = req.body;
+
+    if (!quantity || quantity <= 0) {
+      return res.status(400).json({ error: "Quantity must be greater than 0" });
+    }
+
+    try {
+      await pool.query("BEGIN");
+
+      // Check order is pending
+      const orderCheck = await pool.query(
+        "SELECT * FROM orders WHERE id = $1",
+        [orderId],
+      );
+
+      if (orderCheck.rows.length === 0) {
+        await pool.query("ROLLBACK");
+        return res.status(404).json({ error: "Order not found" });
+      }
+
+      if (orderCheck.rows[0].status !== "pending") {
+        await pool.query("ROLLBACK");
+        return res.status(400).json({ error: "Can only edit pending orders" });
+      }
+
+      // Get current item
+      const itemResult = await pool.query(
+        "SELECT * FROM order_items WHERE id = $1 AND order_id = $2",
+        [itemId, orderId],
+      );
+
+      if (itemResult.rows.length === 0) {
+        await pool.query("ROLLBACK");
+        return res.status(404).json({ error: "Order item not found" });
+      }
+
+      const item = itemResult.rows[0];
+      const oldQuantity = item.quantity;
+      const quantityDiff = quantity - oldQuantity;
+
+      // Get product and check stock
+      const productResult = await pool.query(
+        "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+        [item.product_id],
+      );
+
+      const product = productResult.rows[0];
+
+      // If increasing quantity, check stock
+      if (quantityDiff > 0 && product.stock < quantityDiff) {
+        await pool.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Insufficient stock. Available: ${product.stock}`,
+        });
+      }
+
+      // Update item quantity
+      const updatedItem = await pool.query(
+        "UPDATE order_items SET quantity = $1 WHERE id = $2 RETURNING *",
+        [quantity, itemId],
+      );
+
+      // Adjust product stock (negative if reducing order, positive if increasing)
+      await pool.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
+        quantityDiff,
+        item.product_id,
+      ]);
+
+      await pool.query("COMMIT");
+
+      res.json(updatedItem.rows[0]);
+    } catch (error) {
+      await pool.query("ROLLBACK");
+      console.error("Database error:", error);
+      res.status(500).json({ error: "Failed to update order item" });
+    }
+  },
+);
+
+// DELETE /orders/:orderId/items/:itemId - Remove item from order (only if pending)
+app.delete(
+  "/orders/:orderId/items/:itemId",
+  authenticateToken,
+  async (req, res) => {
+    const orderId = parseInt(req.params.orderId);
+    const itemId = parseInt(req.params.itemId);
+
+    try {
+      await pool.query("BEGIN");
+
+      // Check order is pending
+      const orderCheck = await pool.query(
+        "SELECT * FROM orders WHERE id = $1",
+        [orderId],
+      );
+
+      if (orderCheck.rows.length === 0) {
+        await pool.query("ROLLBACK");
+        return res.status(404).json({ error: "Order not found" });
+      }
+
+      if (orderCheck.rows[0].status !== "pending") {
+        await pool.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ error: "Can only remove items from pending orders" });
+      }
+
+      // Check there's more than one item (can't remove all items)
+      const itemCount = await pool.query(
+        "SELECT COUNT(*) FROM order_items WHERE order_id = $1",
+        [orderId],
+      );
+
+      if (parseInt(itemCount.rows[0].count) <= 1) {
+        await pool.query("ROLLBACK");
+        return res.status(400).json({
+          error: "Cannot remove last item. Delete the order instead.",
+        });
+      }
+
+      // Get item to restore stock
+      const itemResult = await pool.query(
+        "SELECT * FROM order_items WHERE id = $1 AND order_id = $2",
+        [itemId, orderId],
+      );
+
+      if (itemResult.rows.length === 0) {
+        await pool.query("ROLLBACK");
+        return res.status(404).json({ error: "Order item not found" });
+      }
+
+      const item = itemResult.rows[0];
+
+      // Restore stock
+      await pool.query("UPDATE products SET stock = stock + $1 WHERE id = $2", [
+        item.quantity,
+        item.product_id,
+      ]);
+
+      // Delete item
+      await pool.query("DELETE FROM order_items WHERE id = $1", [itemId]);
+
+      await pool.query("COMMIT");
+
+      res.json({ message: "Item removed successfully", itemId });
+    } catch (error) {
+      await pool.query("ROLLBACK");
+      console.error("Database error:", error);
+      res.status(500).json({ error: "Failed to remove order item" });
+    }
+  },
+);
 
 // ===== WORKER ENDPOINTS =====
 
@@ -682,6 +1048,250 @@ app.delete(
     } catch (error) {
       console.error("Database error:", error);
       res.status(500).json({ error: "Failed to delete user" });
+    }
+  },
+);
+
+// ===== SETTINGS ENDPOINTS =====
+
+// GET /settings - Get all settings or by category
+app.get("/settings", authenticateToken, async (req, res) => {
+  const { category } = req.query;
+
+  try {
+    let query = "SELECT * FROM settings";
+    const params = [];
+
+    if (category) {
+      query += " WHERE category = $1";
+      params.push(category);
+    }
+
+    query += " ORDER BY category, setting_key";
+
+    const result = await pool.query(query, params);
+
+    // Convert to key-value object for easier frontend use
+    const settingsObj = {};
+    result.rows.forEach((row) => {
+      let value = row.setting_value;
+
+      // Parse value based on type
+      if (row.setting_type === "boolean") {
+        value = value === "true";
+      } else if (row.setting_type === "number") {
+        value = parseFloat(value);
+      } else if (row.setting_type === "json") {
+        try {
+          value = JSON.parse(value);
+        } catch (e) {
+          console.error("Error parsing JSON setting:", row.setting_key);
+        }
+      }
+
+      settingsObj[row.setting_key] = {
+        value: value,
+        type: row.setting_type,
+        category: row.category,
+        description: row.description,
+        updated_at: row.updated_at,
+      };
+    });
+
+    res.json(settingsObj);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch settings" });
+  }
+});
+
+// GET /settings/:key - Get single setting by key
+app.get("/settings/:key", authenticateToken, async (req, res) => {
+  const { key } = req.params;
+
+  try {
+    const result = await pool.query(
+      "SELECT * FROM settings WHERE setting_key = $1",
+      [key],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Setting not found" });
+    }
+
+    const setting = result.rows[0];
+    let value = setting.setting_value;
+
+    // Parse value based on type
+    if (setting.setting_type === "boolean") {
+      value = value === "true";
+    } else if (setting.setting_type === "number") {
+      value = parseFloat(value);
+    } else if (setting.setting_type === "json") {
+      try {
+        value = JSON.parse(value);
+      } catch (e) {
+        console.error("Error parsing JSON setting:", key);
+      }
+    }
+
+    res.json({
+      key: setting.setting_key,
+      value: value,
+      type: setting.setting_type,
+      category: setting.category,
+      description: setting.description,
+      updated_at: setting.updated_at,
+    });
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch setting" });
+  }
+});
+
+// PATCH /settings - Update multiple settings (admin only)
+app.patch(
+  "/settings",
+  authenticateToken,
+  requireRole("admin"),
+  async (req, res) => {
+    const { settings } = req.body; // Expecting { settings: { key1: value1, key2: value2, ... } }
+
+    if (!settings || typeof settings !== "object") {
+      return res.status(400).json({ error: "Settings object is required" });
+    }
+
+    try {
+      await pool.query("BEGIN");
+
+      const updatedSettings = [];
+
+      for (const [key, value] of Object.entries(settings)) {
+        // Convert value to string for storage
+        let stringValue = value;
+        if (typeof value === "object") {
+          stringValue = JSON.stringify(value);
+        } else if (typeof value === "boolean") {
+          stringValue = value.toString();
+        } else {
+          stringValue = String(value);
+        }
+
+        const result = await pool.query(
+          `UPDATE settings 
+         SET setting_value = $1, updated_at = NOW(), updated_by = $2
+         WHERE setting_key = $3
+         RETURNING *`,
+          [stringValue, req.user.userId, key],
+        );
+
+        if (result.rows.length > 0) {
+          updatedSettings.push(result.rows[0]);
+        }
+      }
+
+      await pool.query("COMMIT");
+
+      res.json({
+        message: "Settings updated successfully",
+        updated: updatedSettings.length,
+        settings: updatedSettings,
+      });
+    } catch (error) {
+      await pool.query("ROLLBACK");
+      console.error("Database error:", error);
+      res.status(500).json({ error: "Failed to update settings" });
+    }
+  },
+);
+
+// POST /settings/logo - Upload company logo (admin only)
+app.post(
+  "/settings/logo",
+  authenticateToken,
+  requireRole("admin"),
+  upload.single("logo"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      // Generate URL for the uploaded file
+      const logoUrl = `/uploads/logos/${req.file.filename}`;
+
+      // Delete old logo if exists
+      const oldLogoResult = await pool.query(
+        "SELECT setting_value FROM settings WHERE setting_key = 'company_logo_url'",
+      );
+
+      if (
+        oldLogoResult.rows.length > 0 &&
+        oldLogoResult.rows[0].setting_value
+      ) {
+        const oldLogoPath = "." + oldLogoResult.rows[0].setting_value;
+        if (fs.existsSync(oldLogoPath)) {
+          fs.unlinkSync(oldLogoPath);
+          console.log("Deleted old logo:", oldLogoPath);
+        }
+      }
+
+      // Update settings with new logo URL
+      await pool.query(
+        `UPDATE settings 
+       SET setting_value = $1, updated_at = NOW(), updated_by = $2
+       WHERE setting_key = 'company_logo_url'`,
+        [logoUrl, req.user.userId],
+      );
+
+      res.json({
+        message: "Logo uploaded successfully",
+        url: logoUrl,
+        filename: req.file.filename,
+      });
+    } catch (error) {
+      console.error("Upload error:", error);
+      res.status(500).json({ error: "Failed to upload logo" });
+    }
+  },
+);
+
+// DELETE /settings/logo - Remove company logo (admin only)
+app.delete(
+  "/settings/logo",
+  authenticateToken,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      // Get current logo
+      const result = await pool.query(
+        "SELECT setting_value FROM settings WHERE setting_key = 'company_logo_url'",
+      );
+
+      if (result.rows.length > 0 && result.rows[0].setting_value) {
+        const logoPath = "." + result.rows[0].setting_value;
+
+        // Delete file from filesystem
+        if (fs.existsSync(logoPath)) {
+          fs.unlinkSync(logoPath);
+          console.log("Deleted logo:", logoPath);
+        }
+
+        // Clear logo URL in database
+        await pool.query(
+          `UPDATE settings 
+         SET setting_value = NULL, updated_at = NOW(), updated_by = $1
+         WHERE setting_key = 'company_logo_url'`,
+          [req.user.userId],
+        );
+
+        res.json({ message: "Logo deleted successfully" });
+      } else {
+        res.status(404).json({ error: "No logo found" });
+      }
+    } catch (error) {
+      console.error("Delete error:", error);
+      res.status(500).json({ error: "Failed to delete logo" });
     }
   },
 );
